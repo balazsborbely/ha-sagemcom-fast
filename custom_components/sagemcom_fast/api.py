@@ -7,6 +7,45 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client
 from sagemcom_api.client import SagemcomClient
 from sagemcom_api.enums import ApiMode, EncryptionMethod
+from sagemcom_api.exceptions import InvalidSessionException
+
+
+def _prepare_client(client: SagemcomClient) -> SagemcomClient:
+    """Ensure legacy login resets session state and empty replies raise InvalidSessionException."""
+    if type(client) is not SagemcomClient:
+        return client
+
+    original_login = client.login
+    original_get_device_info = client.get_device_info
+    original_get_hosts = client.get_hosts
+
+    async def login():
+        if client.api_mode != ApiMode.REST:
+            client._session_id = 0  # pylint: disable=protected-access
+            client._server_nonce = ""  # pylint: disable=protected-access
+            client._request_id = -1  # pylint: disable=protected-access
+        return await original_login()
+
+    async def get_device_info():
+        try:
+            return await original_get_device_info()
+        except TypeError as exception:
+            raise InvalidSessionException(
+                "Empty DeviceInfo response from gateway"
+            ) from exception
+
+    async def get_hosts(*args, **kwargs):
+        try:
+            return await original_get_hosts(*args, **kwargs)
+        except TypeError as exception:
+            raise InvalidSessionException(
+                "Empty Hosts response from gateway"
+            ) from exception
+
+    client.login = login  # type: ignore[method-assign]
+    client.get_device_info = get_device_info  # type: ignore[method-assign]
+    client.get_hosts = get_hosts  # type: ignore[method-assign]
+    return client
 
 
 def create_client(
@@ -48,4 +87,4 @@ def create_client(
         ssl=ssl,
         api_mode=api_mode,
     )
-    return client, owned_session
+    return _prepare_client(client), owned_session

@@ -21,6 +21,7 @@ from sagemcom_api.enums import ApiMode, EncryptionMethod
 from sagemcom_api.exceptions import AuthenticationException
 from sagemcom_api.models import DeviceInfo
 
+from custom_components.sagemcom_fast.api import _prepare_client
 from custom_components.sagemcom_fast.config_flow import async_detect_encryption_method
 from custom_components.sagemcom_fast.const import CONF_ENCRYPTION_METHOD, DOMAIN
 
@@ -219,4 +220,33 @@ async def test_detect_encryption_method_resets_request_id_between_probes() -> No
         (EncryptionMethod.MD5, 0),
     ]
     logout_mock.assert_awaited_once()
+
+
+async def test_prepared_client_resets_session_id_before_relogin() -> None:
+    """A legacy client that logged out must not send session-id -1 on the next login."""
+    observed_session_ids: list[int] = []
+    client = SagemcomClient(
+        host="192.0.2.1",
+        username="admin",
+        password="secret",
+        authentication_method=EncryptionMethod.SHA512,
+        session=Mock(),
+        api_mode=ApiMode.LEGACY,
+    )
+
+    async def fake_login() -> bool:
+        observed_session_ids.append(client._session_id)
+        client._session_id = 12345
+        return True
+
+    client.login = fake_login  # type: ignore[method-assign]
+    _prepare_client(client)
+
+    await client.login()
+    # sagemcom_api.logout() sets _session_id = -1 instead of 0
+    client._session_id = -1
+    await client.login()
+
+    assert observed_session_ids == [0, 0]
+
 
