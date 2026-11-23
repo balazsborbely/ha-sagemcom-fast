@@ -1,6 +1,7 @@
 """Config flow for Sagemcom integration."""
 
 from collections.abc import Mapping
+from contextlib import suppress
 from typing import Any
 
 from aiohttp import ClientError
@@ -15,13 +16,16 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from sagemcom_api.client import SagemcomClient
+from sagemcom_api.enums import ApiMode, EncryptionMethod
 from sagemcom_api.exceptions import (
     AccessRestrictionException,
     AuthenticationException,
+    BaseSagemcomException,
     LoginConnectionException,
     LoginRetryErrorException,
     LoginTimeoutException,
     MaximumSessionCountException,
+    UnauthorizedException,
     UnsupportedHostException,
 )
 import voluptuous as vol
@@ -29,6 +33,50 @@ import voluptuous as vol
 from .api import create_client
 from .const import CONF_ENCRYPTION_METHOD, DOMAIN, LOGGER
 from .options_flow import OptionsFlow
+
+
+async def async_detect_encryption_method(
+    client: SagemcomClient,
+) -> EncryptionMethod | None:
+    """Detect the router's encryption method and close the probe session."""
+    if getattr(client, "api_mode", None) is not ApiMode.AUTO:
+        return await client.get_encryption_method()
+
+    # Probe SHA512 before MD5 variants so routers with a 3-attempt lockout
+    # (such as the Sagemcom F@st 5670) do not spend two failed attempts first,
+    # and log out of the probe session before validation logs in again.
+    probe_order = (
+        EncryptionMethod.SHA512,
+        EncryptionMethod.MD5,
+        EncryptionMethod.MD5_NONCE,
+    )
+    for method in probe_order:
+        client.authentication_method = method
+        client._password_hash = client._SagemcomClient__generate_hash(  # pylint: disable=protected-access
+            client.password, method
+        )
+        client._server_nonce = ""  # pylint: disable=protected-access
+        client._session_id = 0  # pylint: disable=protected-access
+        client._request_id = -1  # pylint: disable=protected-access
+        try:
+            await client.login()
+        except (
+            LoginTimeoutException,
+            AuthenticationException,
+            UnauthorizedException,
+        ):
+            continue
+
+        detected = (
+            EncryptionMethod.NONE
+            if client.active_api_mode is ApiMode.REST
+            else method
+        )
+        with suppress(BaseSagemcomException):
+            await client.logout()
+        return detected
+
+    return None
 
 
 async def async_validate_input(
@@ -51,7 +99,7 @@ async def async_validate_input(
         ssl=ssl,
     )
 
-    encryption_method = await client.get_encryption_method()
+    encryption_method = await async_detect_encryption_method(client)
     if encryption_method is None:
         raise AuthenticationException("No login method accepted the credentials")
     data[CONF_ENCRYPTION_METHOD] = encryption_method

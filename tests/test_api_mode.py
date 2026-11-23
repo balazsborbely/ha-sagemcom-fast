@@ -1,6 +1,6 @@
 """Tests for choosing the Sagemcom API mode and HTTP session per router."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
@@ -18,8 +18,10 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from sagemcom_api.client import SagemcomClient
 from sagemcom_api.enums import ApiMode, EncryptionMethod
+from sagemcom_api.exceptions import AuthenticationException
 from sagemcom_api.models import DeviceInfo
 
+from custom_components.sagemcom_fast.config_flow import async_detect_encryption_method
 from custom_components.sagemcom_fast.const import CONF_ENCRYPTION_METHOD, DOMAIN
 
 USER_INPUT = {
@@ -159,3 +161,62 @@ async def test_config_flow_without_matching_method_is_invalid_auth(
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
     validation_class.assert_not_called()
+
+
+async def test_detect_encryption_method_probes_sha512_first_and_logs_out() -> None:
+    """SHA512 routers must not waste two failed MD5 logins or leak the probe session."""
+    attempted_methods: list[tuple[EncryptionMethod | None, int]] = []
+    client = SagemcomClient(
+        host="192.0.2.1",
+        username="admin",
+        password="secret",
+        session=Mock(),
+    )
+
+    async def fake_login() -> bool:
+        attempted_methods.append((client.authentication_method, client._request_id))
+        if client.authentication_method is not EncryptionMethod.SHA512:
+            raise AuthenticationException("wrong method")
+        return True
+
+    client.login = fake_login  # type: ignore[method-assign]
+    logout_mock = AsyncMock()
+    client.logout = logout_mock  # type: ignore[method-assign]
+
+    detected = await async_detect_encryption_method(client)
+
+    assert detected is EncryptionMethod.SHA512
+    assert attempted_methods == [(EncryptionMethod.SHA512, -1)]
+    logout_mock.assert_awaited_once()
+
+
+async def test_detect_encryption_method_resets_request_id_between_probes() -> None:
+    """Each encryption probe must start at request_id -1 and close its session."""
+    attempted_methods: list[tuple[EncryptionMethod | None, int]] = []
+    client = SagemcomClient(
+        host="192.0.2.1",
+        username="admin",
+        password="secret",
+        session=Mock(),
+    )
+
+    async def fake_login() -> bool:
+        client._request_id += 1
+        attempted_methods.append((client.authentication_method, client._request_id))
+        if client.authentication_method is EncryptionMethod.SHA512:
+            raise AuthenticationException("not sha512")
+        return True
+
+    client.login = fake_login  # type: ignore[method-assign]
+    logout_mock = AsyncMock()
+    client.logout = logout_mock  # type: ignore[method-assign]
+
+    detected = await async_detect_encryption_method(client)
+
+    assert detected is EncryptionMethod.MD5
+    assert attempted_methods == [
+        (EncryptionMethod.SHA512, 0),
+        (EncryptionMethod.MD5, 0),
+    ]
+    logout_mock.assert_awaited_once()
+
